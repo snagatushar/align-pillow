@@ -4,30 +4,56 @@ from PIL import Image, ImageOps, ImageEnhance
 import numpy as np
 import cv2
 from io import BytesIO
-import base64
 
 app = FastAPI()
 
-# --- Deskew using OpenCV ---
-def deskew_image_strict(pil_img: Image.Image) -> Image.Image:
-    gray = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2GRAY)
-    gray = cv2.bitwise_not(gray)
-    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
-    coords = np.column_stack(np.where(thresh > 0))
-    angle = cv2.minAreaRect(coords)[-1]
 
-    if angle < -45:
-        angle = -(90 + angle)
+# ---------- Deskew with HoughLines + Fallback ----------
+def deskew_image_strict(pil_img: Image.Image) -> Image.Image:
+    img_np = np.array(pil_img)
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 1))
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+    lines = cv2.HoughLinesP(closed, 1, np.pi / 180, threshold=100,
+                            minLineLength=gray.shape[1] // 2, maxLineGap=20)
+
+    angles = []
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+            if -45 < angle < 45:
+                angles.append(angle)
+
+    if angles:
+        median_angle = np.median(angles)
     else:
-        angle = -angle
+        blur = cv2.GaussianBlur(gray, (9, 9), 0)
+        binary = 255 - cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        coords = cv2.findNonZero(binary)
+
+        if coords is None:
+            return pil_img
+
+        rect = cv2.minAreaRect(coords)
+        angle = rect[-1]
+        if angle < -45:
+            median_angle = -(90 + angle)
+        else:
+            median_angle = -angle
 
     (h, w) = gray.shape
     center = (w // 2, h // 2)
-    M = cv2.getRotationMatrix2D(center, angle, 1.0)
-    rotated = cv2.warpAffine(np.array(pil_img), M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-    return Image.fromarray(rotated)
+    M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
+    rotated = cv2.warpAffine(img_np, M, (w, h), flags=cv2.INTER_CUBIC,
+                             borderValue=(255, 255, 255))
+    return Image.fromarray(rotated).convert("RGB")
 
-# --- Enhance with Pillow ---
+
+# ---------- Enhance ----------
 def enhance_image(image: Image.Image) -> Image.Image:
     gray = ImageOps.grayscale(image)
     if gray.width < 1200:
@@ -36,65 +62,67 @@ def enhance_image(image: Image.Image) -> Image.Image:
     sharpened = ImageEnhance.Sharpness(contrast).enhance(1.5)
     return sharpened.convert("RGB")
 
-# --- Auto Crop ---
-def autocrop(pil_img: Image.Image) -> Image.Image:
-    img_array = np.array(pil_img)
-    if img_array.ndim == 2:
-        mask = img_array < 250
-    else:
-        mask = np.mean(img_array, axis=2) < 250
-    coords = np.argwhere(mask)
-    if coords.size > 0:
-        y0, x0 = coords.min(axis=0)
-        y1, x1 = coords.max(axis=0) + 1
-        return pil_img.crop((x0, y0, x1, y1))
-    return pil_img
 
-# --- Base64 Outputs ---
-def prepare_outputs(image: Image.Image):
-    buffer = BytesIO()
-    image.save(buffer, format="JPEG", quality=85)
-    img_bytes = buffer.getvalue()
-    base64_img = base64.b64encode(img_bytes).decode("utf-8")
-    return {
-        "image_base64": base64_img,
-        "mime_type": "image/jpeg",
-        "file_name": "enhanced.jpg"
-    }
-
-def prepare_pdf_output(image: Image.Image):
-    buffer = BytesIO()
-    image.convert("RGB").save(buffer, format="PDF")
-    pdf_bytes = buffer.getvalue()
-    base64_pdf = base64.b64encode(pdf_bytes).decode("utf-8")
-    return {
-        "pdf_base64": base64_pdf,
-        "mime_type": "application/pdf",
-        "file_name": "enhanced_output.pdf"
-    }
-
-# --- API Endpoint ---
-@app.post("/process-image")
-async def process_image(file: UploadFile = File(...)):
+# ---------- /align-image ----------
+@app.post("/align-image")
+async def align_image(file: UploadFile = File(...)):
     try:
-        # ✅ EXIF-safe loading
         image_data = await file.read()
-        image = Image.open(BytesIO(image_data))
+        image = Image.open(BytesIO(image_data)).convert("RGB")
         image = ImageOps.exif_transpose(image)
-        image = image.convert("RGB")
 
         aligned = deskew_image_strict(image)
-        enhanced = enhance_image(aligned)
-        cropped = autocrop(enhanced)
 
-        image_result = prepare_outputs(cropped)
-        pdf_result = prepare_pdf_output(cropped)
+        img_bytes = BytesIO()
+        aligned.save(img_bytes, format="PNG")
+        img_bytes.seek(0)
 
-        return JSONResponse(content={
-            "image_result": image_result,
-            "pdf_result": pdf_result
+        return StreamingResponse(img_bytes, media_type="image/png", headers={
+            "Content-Disposition": "inline; filename=aligned_image.png"
         })
-
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
+
+# ---------- /enhance-image ----------
+@app.post("/enhance-image")
+async def enhance_image_endpoint(file: UploadFile = File(...)):
+    try:
+        image_data = await file.read()
+        image = Image.open(BytesIO(image_data)).convert("RGB")
+        image = ImageOps.exif_transpose(image)
+
+        aligned = deskew_image_strict(image)
+        enhanced = enhance_image(aligned)
+
+        img_bytes = BytesIO()
+        enhanced.save(img_bytes, format="PNG")
+        img_bytes.seek(0)
+
+        return StreamingResponse(img_bytes, media_type="image/png", headers={
+            "Content-Disposition": "inline; filename=enhanced_image.png"
+        })
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+# ---------- /enhance-to-pdf ----------
+@app.post("/enhance-to-pdf")
+async def enhance_to_pdf(file: UploadFile = File(...)):
+    try:
+        image_data = await file.read()
+        image = Image.open(BytesIO(image_data)).convert("RGB")
+        image = ImageOps.exif_transpose(image)
+
+        aligned = deskew_image_strict(image)
+        enhanced = enhance_image(aligned)
+
+        pdf_buffer = BytesIO()
+        enhanced.save(pdf_buffer, format="PDF")
+        pdf_buffer.seek(0)
+
+        return StreamingResponse(pdf_buffer, media_type="application/pdf", headers={
+            "Content-Disposition": "attachment; filename=enhanced_output.pdf"
+        })
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
